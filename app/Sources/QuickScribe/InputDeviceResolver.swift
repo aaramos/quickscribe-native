@@ -3,7 +3,8 @@ import CoreAudio
 import Foundation
 
 /// Input-device resolution: a Mac's default input can be a virtual loopback
-/// such as BlackHole, which carries NO live signal and once fed the recognizer silence and produced invented text. The app must therefore NEVER trust the OS default
+/// such as BlackHole, which carries NO live signal and once fed the recognizer
+/// silence and produced invented text. The app must therefore NEVER trust the OS default
 /// blindly.
 ///
 /// Resolution order:

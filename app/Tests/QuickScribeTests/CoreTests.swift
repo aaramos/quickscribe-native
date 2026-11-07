@@ -123,6 +123,256 @@ final class CleanupGuardTests: XCTestCase {
         XCTAssertTrue(ok("Some words were spoken aloud today.", "Some words were said.", "rewrite"))
         XCTAssertFalse(ok("It rose 40 percent.", "It rose a lot.", "rewrite"))
     }
+    func testACorrectionCarriesTheSpokenMoneyToTheAmountTheSpeakerMeant() {
+        // The reported failure, end to end from what Apple's speech wrote: the
+        // model cleaned it correctly, and the guard refused the corrected
+        // amount because its own number had no dollar sign in the input.
+        let heard = "The invoice total is $1,200. Actually, 1450. Do Friday."
+        let cleaned = "The invoice total is $1,450, due Friday."
+        XCTAssertTrue(ok(cleaned, heard), "the corrected amount keeps the money the speaker said")
+        XCTAssertFalse(CleanupGuard.inventsCurrency(output: cleaned, input: heard))
+
+        // Every correction word the proposal names does the same linking.
+        for correction in ["actually", "I mean", "sorry", "no"] {
+            let input = "the invoice total is $1,200, \(correction) 1450"
+            XCTAssertTrue(ok("The invoice total is $1,450.", input),
+                          "\(correction) links the two amounts")
+        }
+        // Money said as a word travels across the correction too.
+        XCTAssertTrue(ok("The invoice total is $1,450.", "the invoice total is 1,200 dollars, actually 1450"))
+
+        // Still refused: the sign on a number no correction links.
+        XCTAssertFalse(ok("The invoice total is $1,200 for $14 people.", "the invoice total is $1,200 for 14 people"),
+                       "an unrelated number must not collect a dollar sign, even in the same sentence")
+        XCTAssertFalse(ok("The invoice total is $1,200. Actually, €1,450.", "the invoice total is $1,200, actually 1450"),
+                       "the correction may keep the money said, never change it")
+        XCTAssertFalse(ok("The quote was $1,450.", "the quote was 1,200, actually 1450"),
+                       "no money was said anywhere, so the sign is still invented")
+        XCTAssertFalse(ok("The quote was $1,200, and $1,450.", "the quote was $1,200, and 1450"),
+                       "and is not a correction word")
+        XCTAssertFalse(ok("$1,200 for $14 people.", "the invoice total is $1,200 for 14 people"),
+                       "a number joined by other words is not a correction of the amount")
+        XCTAssertFalse(ok("$1,200 or $14 a head.", "the invoice total is $1,200 or 14 a head"),
+                       "or is not a correction word either")
+        XCTAssertFalse(ok("The quote was $1,300.", "the quote was $1,200, actually 1450, actually 1300"),
+                       "a second correction is not trusted: the model was told three amounts")
+    }
+
+    func testGuardRefusesACurrencyTheSpeakerNeverNamed() {
+        XCTAssertFalse(CleanupGuard.accepts(output: "Revenue was $4.2 million last quarter.",
+                                            input: "revenue was 4.2 million last quarter", mode: "polish"),
+                       "a dollar sign from nowhere turns a number into a confident wrong one")
+        XCTAssertTrue(CleanupGuard.accepts(output: "Revenue was $4.2 million.",
+                                           input: "revenue was 4.2 million dollars", mode: "polish"),
+                      "the word dollars may become the sign")
+        XCTAssertTrue(CleanupGuard.accepts(output: "It is $1400.", input: "it is $1400", mode: "polish"))
+        XCTAssertFalse(CleanupGuard.accepts(output: "It costs €5.", input: "it costs 5", mode: "polish"))
+        XCTAssertTrue(CleanupGuard.accepts(output: "It costs 5 euros.", input: "it costs 5 euros", mode: "polish"))
+        // Rewrite's looser limits still never allow invented currency.
+        XCTAssertFalse(CleanupGuard.accepts(output: "The rent is $950 a month.",
+                                            input: "the rent is 950 a month", mode: "rewrite"))
+    }
+    func testGuardRefusesATimeOfDayTheSpeakerNeverSaid() {
+        let Friday = "let's meet at three on friday"
+        for invented in ["Let's meet at 3pm on Friday.", "Let's meet at 3 p.m. on Friday.",
+                         "Let's meet at 3:00 PM on Friday.", "Let's meet at 3 PM Friday",
+                         "Let's meet at three p.m. on Friday."] {
+            XCTAssertFalse(CleanupGuard.accepts(output: invented, input: Friday, mode: "polish"),
+                           "\(invented) adds a time of day from nowhere")
+        }
+        XCTAssertFalse(CleanupGuard.accepts(output: "The pharmacy closes at 9 p.m. tonight.",
+                                            input: "the pharmacy closes at nine tonight", mode: "concise"),
+                       "tonight is not saying p.m.")
+        // Said means said: words, digits, dots all count.
+        XCTAssertTrue(CleanupGuard.accepts(output: "Let's meet at 3 p.m. on Friday.",
+                                           input: "let's meet at 3 p.m. on friday", mode: "polish"))
+        XCTAssertTrue(CleanupGuard.accepts(output: "Let's meet at 3 p.m. on Friday.",
+                                           input: "let's meet at three pm friday", mode: "polish"))
+        XCTAssertTrue(CleanupGuard.accepts(output: "Let's meet at 3 on Friday.",
+                                           input: "let's meet at three on friday", mode: "polish"),
+                      "keeping the speaker's clock-free words passes")
+        // The verb is not a marker, and never wears one: "I am" is not a.m.,
+        // and an am glued to the hour ("3 am I right") is still a verb.
+        XCTAssertTrue(CleanupGuard.accepts(output: "I am meeting Dana at 3 on Friday.",
+                                           input: "i am meeting dana at three on friday", mode: "polish"),
+                      "I am must never read as a.m.")
+        // On the ANSWER side the exception is gone: an am glued to the hour,
+        // even "3 am I right", is refused, because falling back is cheap.
+        // On the SPEAKER side the verb never supplies a marker.
+        XCTAssertFalse(CleanupGuard.accepts(output: "Let's start at 3 am I right.",
+                                            input: "let's start at three am i right", mode: "polish"),
+                       "a written am the speaker did not say drops to the person's words")
+        XCTAssertTrue(CleanupGuard.accepts(output: "At 3 a.m. I left.", input: "at 3 a.m. i left", mode: "polish"),
+                      "a dotted a.m. the speaker said stands as evidence before the verb")
+        XCTAssertFalse(CleanupGuard.accepts(output: "I am 3pm on the dot.",
+                                            input: "i am on the dot at three", mode: "polish"),
+                       "a real invented 3pm is stamped even beside a verb am")
+        // Words that merely END in the letters a-m are not clocks.
+        XCTAssertFalse(CleanupGuard.inventsTimeOfDay(output: "Tell the team the launch is in July.",
+                                                     input: "tell the team the launch is in july"),
+                       "t-eam is not a.m.; the guard must not blink at letters")
+        XCTAssertFalse(CleanupGuard.inventsTimeOfDay(output: "Maybe ice cream, the pistachio one.",
+                                                     input: "maybe ice cream the pistachio one"),
+                       "cr-eam is not a.m. either")
+        // Speech that writes the hour as a word still says am or pm, and both
+        // directions of that get read.
+        XCTAssertTrue(CleanupGuard.accepts(output: "The 3 a.m. report is late.",
+                                           input: "the three am report is late", mode: "concise"),
+                      "an hour word before am counts as saying it")
+        XCTAssertFalse(CleanupGuard.accepts(output: "The three a.m. report is late.",
+                                            input: "the report is late at three", mode: "concise"),
+                       "and an invented teen-hour marker is still stamped")
+        // A clock reading spoken in words: spaced p m marks and o'clock.
+        XCTAssertTrue(CleanupGuard.accepts(output: "The 4 p.m. report is late for the 4 pm report from four pm.",
+                                           input: "the four o'clock report is late for the four p m report from four p m",
+                                           mode: "rewrite"),
+                      "the spoken p m makes the word four a clock reading")
+        XCTAssertTrue(CleanupGuard.accepts(output: "The 4 o'clock report is late for the 4 pm report.",
+                                           input: "the four o'clock report is late for the four pm report",
+                                           mode: "rewrite"),
+                      "rewrite keeps a spoken three o'clock as a digit")
+        // Rewrite's looser limits still refuse it.
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet at 3 p.m. Friday.",
+                                            input: Friday, mode: "rewrite"))
+    }
+    func testSpacedMarkersFoldWhereverTheyStand() {
+        // A dotted marker folds to the plain form wherever it sits in the
+        // sentence. Matching only "marker plus trailing space" was a trap: an
+        // end-of-sentence "3 p. m." then never folded, and gluing on the
+        // swallowed space turned "p. m. today" into "pmtoday". A faithful
+        // cleanup of a spaced marker passes both ways; an invented one does not.
+        XCTAssertTrue(CleanupGuard.accepts(output: "Call me at 3 p. m.",
+                                           input: "call me at three pm", mode: "polish"),
+                      "the marker at the end of a sentence still folds")
+        XCTAssertTrue(CleanupGuard.accepts(output: "Call me at 3 pm today.",
+                                           input: "call me at three p. m. today", mode: "polish"),
+                      "the speaker's spaced dots fold too, without gluing the next word on")
+        XCTAssertTrue(CleanupGuard.accepts(output: "Call me at 3 p. m. on Friday.",
+                                           input: "call me at three pm on friday", mode: "polish"),
+                      "more words follow the marker and keep their space")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Call me at 3 p. m.",
+                                            input: "call me at three", mode: "polish"),
+                       "a spaced p. m. the speaker never said remains an invention")
+    }
+    func testEveryMarkerIsTiedToItsOwnNumber() {
+        // Currency. One said dollar clears only its own number.
+        XCTAssertFalse(CleanupGuard.accepts(
+            output: "The invoice total is $1,200, actually $1,450, and the account number ends in $6,729.",
+            input: "the invoice total is $1,200, actually $1,450 and the account number ends in 6729", mode: "polish"),
+            "the account number never had money on it")
+        XCTAssertFalse(CleanupGuard.accepts(
+            output: "$5 for the fee, room number is $212.",
+            input: "the fee is 5 dollars and the room number is 212", mode: "polish"),
+            "dollars on the fee do not license a sign on the room number")
+        // The speaker's own correction carries the money marker across: the
+        // corrected amount is the one they meant, and a number keeps the sign
+        // it was said with even when the engine wrote the first one as a sign.
+        XCTAssertTrue(CleanupGuard.accepts(
+            output: "The quote was $1,450.",
+            input: "the quote was $1,200, actually 1450", mode: "polish"),
+            "the correction word links the two amounts, so the sign they said belongs to the one they meant")
+        // Still fine: the number the speaker gave in money words or signs.
+        XCTAssertTrue(CleanupGuard.accepts(output: "$4.2 million last quarter.",
+                                           input: "4.2 million dollars last quarter", mode: "polish"))
+        // A spelled number and a written one are the same number. Asserted on
+        // the currency rule alone: repeating one number as words AND digits in
+        // one answer trips the old digit-stream rule on purpose.
+        XCTAssertFalse(CleanupGuard.inventsCurrency(output: "The total is $50,000.",
+                                                    input: "forty thousand, sorry, fifty thousand dollars"))
+
+        // Time of day, tied and same-kind.
+        XCTAssertFalse(CleanupGuard.accepts(
+            output: "The call is at 9 a.m. and lunch is at 1 p.m.",
+            input: "the call is at 9 a.m. and lunch is at one", mode: "polish"),
+            "a spoken morning does not clear an invented afternoon")
+        XCTAssertFalse(CleanupGuard.accepts(
+            output: "The call is at 9 p.m. tomorrow.",
+            input: "the call is at 9 a.m. tomorrow", mode: "polish"),
+            "the worst case: a wrong time that reads as right")
+        // Markers must ride their own number; the sentence next door is not evidence.
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet me at 3 p.m. on Friday.",
+                                            input: "stop. Meet me at three on friday", mode: "polish"))
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet me at 3 p.m.",
+                                            input: "we flew to tampa. meet me at three", mode: "polish"))
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet at 2 p.m., we have 3 ideas.",
+                                            input: "we have 3 amazing ideas, so meet at two", mode: "polish"),
+                      "amazing is not a.m., and the PM next door is not p.m.")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet at 3 p.m. on Friday.",
+                                            input: "ask the pm about the meeting at three", mode: "polish"),
+                      "a person called the PM has not said p.m. about the hour")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet at three pm on friday.",
+                                            input: "meet at three on friday", mode: "polish"),
+                      "the lower-case shape is caught like the upper-case one")
+        XCTAssertTrue(CleanupGuard.accepts(output: "Meet at 3 p.m. on Friday.",
+                                           input: "meet at three pm friday", mode: "polish"))
+        XCTAssertTrue(CleanupGuard.accepts(output: "I am meeting Dana at 3 on Friday.",
+                                           input: "i am meeting dana at three on friday", mode: "polish"))
+        XCTAssertFalse(CleanupGuard.accepts(
+            output: "Call me at 3 am I will be up.",
+            input: "call me at three i will be up", mode: "polish"),
+            "the verb exception covers the speaker, not the model's writing")
+    }
+    func testFreeStandingMarkersNeedOneTheSpeakerWrote() {
+        // A marker that stands free of any number is still a claim of a time
+        // of day, and only the speaker's own free marker clears it.
+        XCTAssertFalse(CleanupGuard.accepts(output: "Let's meet on Friday p.m.",
+                                            input: "let's meet on friday", mode: "polish"),
+                       "p.m. after the weekday, tied to nothing")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet at 3 o'clock p.m. on Friday.",
+                                            input: "meet at three o'clock on friday", mode: "polish"),
+                       "p.m. a word away from the hour is free-standing")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Meet at 3 on Friday p.m.",
+                                            input: "meet at three on friday", mode: "polish"),
+                       "the marker ended up on the weekday's tail")
+        XCTAssertTrue(CleanupGuard.accepts(output: "The 3 p.m. call and the p.m. news.",
+                                           input: "the 3 p.m. call and the p.m. news", mode: "polish"),
+                      "tied stays tied, free stands on its own speaker-written twin")
+        XCTAssertFalse(CleanupGuard.inventsTimeOfDay(output: "Babe, I am grabbing dinner.",
+                                                     input: "babe grab dinner on your way home"),
+                       "the verb am, pronoun beside it, claims no time on the written side either")
+        XCTAssertTrue(CleanupGuard.inventsTimeOfDay(output: "Watch the a.m. news.", input: "watch the news"),
+                      "a dotted a.m. is never a verb and still claims a time")
+        // Word boundaries: "often" holds no ten, "someone" no one, so an
+        // answer left untouched is never stamped for a verb's am.
+        XCTAssertTrue(CleanupGuard.accepts(output: "It costs often. Am I right?",
+                                           input: "it costs often. am i right?", mode: "polish"),
+                      "the free am copies the speaker's own free am")
+    }
+
+    func testListShapesSuffixSignsAndAddedMoneyWords() {
+        // List shapes: the number under a heading is its own number.
+        XCTAssertFalse(CleanupGuard.accepts(output: "Item 3: $212 units.",
+                                            input: "item 3: 212 units.", mode: "polish"),
+                       "a colon with a space ends the phrase")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Item 3\n$212 units",
+                                            input: "item 3\n212 units", mode: "polish"),
+                       "a line break ends the phrase; lists are where this bites")
+        XCTAssertFalse(CleanupGuard.accepts(output: "Room 3 - $212 today.",
+                                            input: "room 3 - 212 today", mode: "polish"),
+                       "a dash ends the phrase")
+        // A sign after the number is a sign on it; a money word in the
+        // answer is a claim just as much as the sign.
+        XCTAssertFalse(CleanupGuard.accepts(output: "The room number is 212€.",
+                                            input: "the room number is 212", mode: "polish"))
+        XCTAssertFalse(CleanupGuard.accepts(output: "The room number is 212 dollars.",
+                                            input: "the room number is 212", mode: "polish"),
+                       "'212 dollars' claims money as loudly as '$212' does")
+        // Goldens.
+        XCTAssertFalse(CleanupGuard.inventsCurrency(output: "The total is $50,000.",
+                                                    input: "fifty thousand dollars"),
+                       "a spelled number and a written one are the same number")
+        XCTAssertTrue(CleanupGuard.accepts(output: "Meet at 3 and 5 p.m.",
+                                           input: "meet at three and five pm", mode: "polish"))
+        XCTAssertTrue(CleanupGuard.accepts(output: "Leave at 3:30 p.m.",
+                                           input: "leave at three thirty pm", mode: "polish"),
+                      "a colon between digits with no space stays one number")
+        XCTAssertTrue(CleanupGuard.accepts(output: "Pay $5 and $6.",
+                                           input: "pay 5 dollars and 6 dollars", mode: "polish"))
+    }
+
+
+
+
 }
 
 final class CleanupGuardAddedSentenceTests: XCTestCase {

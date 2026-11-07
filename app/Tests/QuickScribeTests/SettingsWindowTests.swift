@@ -13,10 +13,21 @@ final class SettingsWindowTests: XCTestCase {
         all(NSButton.self, in: root).first { $0.title == title }!
     }
 
+    /// Settings now owns the connection section too, so every test needs a store.
+    /// The suite name is throwaway and the secrets live in memory.
+    private func makeSettings(library: PromptLibrary) -> SettingsWindow {
+        let suite = "qs-settings-tests-\(UUID().uuidString)"
+        let store = EndpointSettingsStore(defaults: UserDefaults(suiteName: suite)!, secrets: MemorySecrets.Store())
+        addTeardownBlock {
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+        }
+        return SettingsWindow(library: library, endpointStore: store)
+    }
+
     func testEditSaveResetAndTryItOnSampleText() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("prompts.json")
         let library = PromptLibrary(fileURL: url)
-        let settings = SettingsWindow(library: library)
+        let settings = makeSettings(library: library)
         settings.show()
         defer { settings.window?.close() }
         let root = try XCTUnwrap(settings.window?.contentView)
@@ -44,4 +55,149 @@ final class SettingsWindowTests: XCTestCase {
         XCTAssertTrue(output.string.contains("3"), output.string)
         XCTAssertFalse(output.string.lowercased().contains("um so"), output.string)
     }
+    func testPromptTestRunsTheSelectedRoute() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("prompts.json")
+        let library = PromptLibrary(fileURL: url)
+        let settings = makeSettings(library: library)
+        settings.show()
+        defer { settings.window?.close() }
+        let root = try XCTUnwrap(settings.window?.contentView)
+        let editor = try XCTUnwrap(all(NSTextView.self, in: root).first { $0.string == FactoryPrompts.polish })
+        var seen: [(route: CleanupRoute, prompt: String)] = []
+        settings.promptTester = { route, _, instructions, _, _ in
+            seen.append((route, instructions)); return "done"
+        }
+        let test = button("Test Prompt", root)
+        func run() async throws {
+            test.performClick(nil)
+            for _ in 0..<150 where !test.isEnabled {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertTrue(test.isEnabled, "Test Prompt never finished")
+        }
+
+        try await run()
+        XCTAssertEqual(seen.last?.route, .apple)
+        XCTAssertEqual(seen.last?.prompt, FactoryPrompts.polish)
+
+        // Cleanup switched to a service model, which the menu bar now sets and
+        // settings keeps: the test follows the route and its longer factory
+        // set, even though the editor never changed. An address must be set
+        // first: a service without one stays Apple.
+        let address = try XCTUnwrap(all(NSTextField.self, in: root).first { $0.placeholderString == "http://192.168.1.20:1234/v1" })
+        address.stringValue = "http://127.0.0.1:1234/v1"
+        address.sendAction(address.action!, to: address.target)
+        var s = settings.endpointStore.load()
+        s.useCustomCleanup = true
+        s.cleanupModel = "tidy-y"
+        settings.endpointStore.save(s)
+        try await run()
+        XCTAssertEqual(seen.last?.route, .service)
+        XCTAssertEqual(seen.last?.prompt, ServicePrompts.polish,
+                       "the service route tests its own factory set")
+
+        // A saved prompt of the person's own wins on both routes.
+        editor.string = "My own words."
+        editor.delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: editor))
+        button("Save", root).performClick(nil)
+        for service in [false, true] {
+            var s = settings.endpointStore.load()
+            s.useCustomCleanup = service
+            settings.endpointStore.save(s)
+            try await run()
+            XCTAssertEqual(seen.last?.route, service ? .service : .apple)
+            XCTAssertEqual(seen.last?.prompt, "My own words.")
+        }
+    }
+
+    func testEditorShowsSavesAndResetsTheSelectedRouteFactory() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("prompts.json")
+        let library = PromptLibrary(fileURL: url)
+        let settings = makeSettings(library: library)
+        settings.show()
+        defer { settings.window?.close() }
+        let root = try XCTUnwrap(settings.window?.contentView)
+        let editor = try XCTUnwrap(all(NSTextView.self, in: root).first { $0.string == FactoryPrompts.polish })
+        let address = try XCTUnwrap(all(NSTextField.self, in: root).first { $0.placeholderString == "http://192.168.1.20:1234/v1" })
+        address.stringValue = "http://127.0.0.1:1234/v1"
+        address.sendAction(address.action!, to: address.target)
+        func choose(_ service: Bool) {
+            var s = settings.endpointStore.load()
+            s.useCustomCleanup = service
+            settings.endpointStore.save(s)
+            settings.showCurrentMode()
+        }
+        func type(_ text: String) {
+            editor.string = text
+            editor.delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: editor))
+        }
+
+        choose(true)   // a service cleanup model
+        XCTAssertEqual(editor.string, ServicePrompts.polish, "the editor shows the route that runs")
+
+        type("Mine.")
+        choose(false)
+        XCTAssertEqual(editor.string, "Mine.", "unsaved typing survives a route flip")
+
+        button("Save", root).performClick(nil)
+        choose(false); XCTAssertEqual(editor.string, "Mine.")
+        choose(true); XCTAssertEqual(editor.string, "Mine.", "a custom prompt is the person's own on both routes")
+
+        button("Reset to Default", root).performClick(nil)
+        XCTAssertEqual(editor.string, ServicePrompts.polish, "reset returns the CURRENT route's factory")
+
+        // Typing Apple's factory while on the service route saves nothing custom:
+        // either route's factory text is still factory.
+        type(FactoryPrompts.polish)
+        button("Save", root).performClick(nil)
+        let status = all(NSTextField.self, in: root).first { $0.stringValue.contains("Factory default") }
+        XCTAssertNotNil(status, "matching any factory is not a custom prompt")
+        XCTAssertFalse(PromptLibrary(fileURL: url).entry("polish")?.custom ?? true)
+    }
+
+    /// The prompt test opens the Keychain only for the service route.
+    func testPromptTestReadsTheKeyOnlyOnTheServiceRoute() async throws {
+        final class CountingSecrets: SecretStoring, @unchecked Sendable {
+            private let lock = NSLock()
+            private var n = 0
+            func secret() -> String? { lock.lock(); n += 1; lock.unlock(); return "k" }
+            func setSecret(_ value: String?) throws {}
+            var reads: Int { lock.lock(); defer { lock.unlock() }; return n }
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("prompts.json")
+        let suite = "qs-settings-keys-\(UUID().uuidString)"
+        let secrets = CountingSecrets()
+        let store = EndpointSettingsStore(defaults: UserDefaults(suiteName: suite)!, secrets: secrets)
+        let settings = SettingsWindow(library: PromptLibrary(fileURL: url), endpointStore: store)
+        settings.show()
+        defer {
+            settings.window?.close()
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+        }
+        let root = try XCTUnwrap(settings.window?.contentView)
+        var keys: [String?] = []
+        settings.promptTester = { _, _, _, _, key in keys.append(key); return "done" }
+        let test = button("Test Prompt", root)
+        func run() async throws {
+            test.performClick(nil)
+            for _ in 0..<150 where !test.isEnabled { try await Task.sleep(nanoseconds: 20_000_000) }
+        }
+        let shown = secrets.reads   // the connection field echoes the stored key on load
+        try await run()
+        XCTAssertEqual(secrets.reads, shown, "the Apple route never opens the Keychain")
+        XCTAssertNil(keys.last ?? nil)
+
+        let address = try XCTUnwrap(all(NSTextField.self, in: root).first { $0.placeholderString == "http://192.168.1.20:1234/v1" })
+        address.stringValue = "http://127.0.0.1:1234/v1"
+        address.sendAction(address.action!, to: address.target)
+        var s = settings.endpointStore.load()
+        s.useCustomCleanup = true
+        s.cleanupModel = "tidy-y"
+        settings.endpointStore.save(s)
+        let before = secrets.reads
+        try await run()
+        XCTAssertEqual(secrets.reads, before + 1, "one read, exactly when the service answers")
+        XCTAssertEqual(keys.last ?? nil, "k")
+    }
+
 }

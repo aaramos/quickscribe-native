@@ -1,25 +1,23 @@
 import AVFoundation
+import EvalSupport
 import Foundation
 import QuickScribeCore
 
-// Compares Apple's speech and cleanup with today's QuickScribe on the same
-// scripted dictations. Usage:
-//   apple-eval speech <corpus.json> <audio-dir>               -> JSON lines
-//   apple-eval clean <corpus.json> <variant>                  -> JSON lines
-//   apple-eval limits
-//   apple-eval live <file.wav> ...
+// Runs the same scripted dictations through the app's own cleanup code:
+// Apple's on-device model, or, for the service_* variants, a real
+// OpenAI-compatible server named entirely by the environment:
+//   QSE_BASE=<url> QSE_MODEL=<name> and QSE_KEY=<key> or QSE_KEYFILE=<json>
+// Usage:
+//   cleanup-eval speech <corpus.json> <audio-dir>               -> JSON lines
+//   cleanup-eval clean <corpus.json> <variant>                  -> JSON lines
+//       variants: rules | polish | concise | active_voice | rewrite
+//       ... or service_polish and friends, which run the person's service
+//   cleanup-eval limits
+//   cleanup-eval live <file.wav> ...
 
-struct Item: Decodable { let id: String; let raw: String }
+let emit = evalEmit
 
-func corpus(_ path: String) throws -> [Item] {
-    try JSONDecoder().decode([Item].self, from: Data(contentsOf: URL(fileURLWithPath: path)))
-}
-
-func emit(_ row: [String: Any]) {
-    let data = try! JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
-    print(String(decoding: data, as: UTF8.self))
-    fflush(stdout)
-}
+func corpus(_ path: String) throws -> [Item] { try evalCorpus(path) }
 
 func transcribe(file: URL) async throws -> (String, Double, Double) {
     let audio = try AVAudioFile(forReading: file)
@@ -59,13 +57,21 @@ func instructions(_ variant: String) -> (String?, AppleCleaner.Filter) {
     case "concise": return (FactoryPrompts.concise, .permissive)
     case "active_voice": return (FactoryPrompts.activeVoice, .permissive)
     case "rewrite": return (FactoryPrompts.rewrite, .permissive)
+    case "service_polish": return (ServicePrompts.polish, .permissive)
+    case "service_concise": return (ServicePrompts.concise, .permissive)
+    case "service_active_voice": return (ServicePrompts.activeVoice, .permissive)
+    case "service_rewrite": return (ServicePrompts.rewrite, .permissive)
     default: fatalError("unknown variant \(variant)")
     }
 }
 
+func guardMode(_ variant: String) -> String { evalGuardMode(variant) }
+func serviceCleaner() -> any Cleaning { evalServiceCleaner() }
+
 func runClean(_ args: [String]) async throws {
-    let (prompt, filter) = instructions(args[1])
-    let cleaner = AppleCleaner(filter: filter)
+    let variant = args[1]
+    let (prompt, filter) = instructions(variant)
+    let cleaner: any Cleaning = variant.hasPrefix("service_") ? serviceCleaner() : AppleCleaner(filter: filter)
     for item in try corpus(args[0]) {
         let tidied = TextCleanup.tidy(item.raw)
         guard let prompt else {
@@ -76,7 +82,7 @@ func runClean(_ args: [String]) async throws {
         do {
             let text = try await cleaner.clean(tidied, instructions: prompt)
             let seconds = Date().timeIntervalSince(start)
-            if CleanupGuard.accepts(output: text, input: tidied, mode: args[1]) {
+            if CleanupGuard.accepts(output: text, input: tidied, mode: guardMode(variant)) {
                 emit(["id": item.id, "text": text, "seconds": seconds])
             } else {
                 emit(["id": item.id, "text": tidied, "seconds": seconds, "guarded": text])
@@ -157,5 +163,5 @@ case "speech": try await runSpeech(Array(arguments.dropFirst()))
 case "clean": try await runClean(Array(arguments.dropFirst()))
 case "limits": await runLimits()
 case "live": try await runLive(Array(arguments.dropFirst()))
-default: print("usage: apple-eval speech|clean|limits|live ...")
+default: print("usage: cleanup-eval speech|clean|limits|live ...")
 }

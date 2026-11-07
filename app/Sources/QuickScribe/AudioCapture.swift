@@ -217,7 +217,7 @@ final class AudioCapture {
             activeDevice = nil
             liveTapFormat = nil
             // Failed engine instance has already pinned the device it tried
-            //
+            // engines pin at first touch for their LIFETIME
             // — swap in a fresh one so the next start() re-pins the CURRENT
             // resolver choice. We are idle by construction here, the same
             // precondition invalidateEngine asserts.

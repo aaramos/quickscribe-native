@@ -23,12 +23,13 @@ final class OverlayShotsTests: XCTestCase {
             try await Task.sleep(nanoseconds: 350_000_000)
             let frame = overlay.panelFrameForTesting
             XCTAssertTrue(overlay.panelIsVisibleForTesting, name)
-            XCTAssertEqual(frame.height, state.isRecording ? 78 : 40, name)
+            XCTAssertEqual(frame.height, state.isRecording ? OverlayController.recordingHeight : 40, name)
             let screen = try XCTUnwrap(NSScreen.screens.first { $0.frame.contains(frame) })
             XCTAssertEqual(frame.midX, screen.visibleFrame.midX, accuracy: 1, name)
             XCTAssertLessThanOrEqual(frame.maxY, screen.visibleFrame.maxY, name)
             XCTAssertGreaterThan(frame.maxY, screen.visibleFrame.maxY - 20, name)
-            XCTAssertLessThanOrEqual(frame.width, 520, name)
+            XCTAssertLessThanOrEqual(frame.width, OverlayController.maxWidth, name)
+            XCTAssertLessThanOrEqual(frame.maxX, screen.visibleFrame.maxX, "\(name) stays on the screen it sits on")
             XCTAssertGreaterThanOrEqual(frame.width, 40, name)
             print("PILL", name, Int(frame.width), "x", Int(frame.height))
             if let folder, let view = overlay.panelContentForTesting {
@@ -46,10 +47,20 @@ final class OverlayShotsTests: XCTestCase {
     func testNormalSpeechFillsMostOfTheWaveHeight() {
         func loudness(rms: Double) -> Double { WaveformView.loudness(fromLevel: rms * 6) }
         XCTAssertEqual(WaveformView.loudness(fromLevel: 0), 0)
-        XCTAssertEqual(loudness(rms: 0.003), 0, "room noise stays flat")
-        XCTAssertGreaterThan(loudness(rms: 0.01), 0.25, "quiet speech")
-        XCTAssertGreaterThan(loudness(rms: 0.03), 0.6, "normal speech")
+        XCTAssertGreaterThan(loudness(rms: 0.01), 0.3, "quiet speech now climbs the taller waves")
+        XCTAssertGreaterThan(loudness(rms: 0.03), 0.75, "normal speech rides near the top")
         XCTAssertEqual(loudness(rms: 0.1), 1, "loud speech")
+    }
+
+    func testRoomNoiseKeepsTheWavesNearlyFlat() {
+        func loudness(rms: Double) -> Double { WaveformView.loudness(fromLevel: rms * 6) }
+        // A laptop fan or a humming room sits well under the silence floor;
+        // pauses must still go nearly flat against it, not just against digital
+        // zero. A real mic against the room's actual noise can only be judged in a real room.
+        for noise in [0.0004, 0.001, 0.002, 0.0035] {
+            XCTAssertLessThanOrEqual(loudness(rms: noise), 0.15, "rms \(noise) must not wake the waves")
+        }
+        XCTAssertEqual(loudness(rms: 0.003), 0, "ordinary room noise stays flat")
     }
 
     private func save(_ view: NSView, to path: String) {
@@ -68,4 +79,30 @@ final class InsertionTargetTests: XCTestCase {
         XCTAssertEqual(InsertionTarget.classify(role: "AXWebArea", hasTextCursor: false), .unsure)
         XCTAssertEqual(InsertionTarget.classify(role: nil, hasTextCursor: false), .unsure)
     }
+    func testTheAccessibilityNoticeFitsThePillAndSaysWhatToDo() {
+        // The sentence AppDelegate shows when Accessibility is not in effect.
+        // It must fit the pill in the real font, so the end is never cut off,
+        // and it must name the remove-and-add-again step.
+        let sentence = AppDelegate.accessibilityOffNotice
+        let text = NSAttributedString(string: sentence, attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium),
+        ])
+        XCTAssertLessThanOrEqual(text.size().width, OverlayController.messageTextBudget,
+                                 "the Accessibility notice is cut off at the end on the pill")
+        XCTAssertTrue(sentence.contains("remove it and add it again"))
+        XCTAssertFalse(sentence.contains("—"), "no em dashes in on-screen text")
+    }
+
+    func testTheUpdateNoticeFitsThePill() {
+        // The sentence AppDelegate shows when GitHub says a release is newer.
+        // If that wording changes, this test's string must change with it.
+        let sentence = "Version 2.10 is out. Open the QuickScribe menu."
+        let text = NSAttributedString(string: sentence, attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .medium),
+        ])
+        let width = text.size().width
+        XCTAssertLessThanOrEqual(width, OverlayController.messageTextBudget,
+                                 "the update notice is cut mid-word on the pill")
+    }
+
 }

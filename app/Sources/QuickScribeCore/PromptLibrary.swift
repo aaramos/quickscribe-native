@@ -50,9 +50,16 @@ public final class PromptLibrary {
         if tokens > maxTokens { throw PromptProblem.tooLong(tokens: tokens) }
     }
 
-    public func prompt(_ mode: String) -> String {
-        if mode == FactoryPrompts.rewriteID { return FactoryPrompts.rewrite }
-        return overrides[mode] ?? FactoryPrompts.all[mode] ?? FactoryPrompts.polish
+    /// Apple's short prompts fit Apple's model; a general service gets the
+    /// longer set. A person's own prompt for a mode wins on BOTH
+    /// routes, because it is their wording, not our tuning.
+    public func prompt(_ mode: String, route: CleanupRoute = .apple) -> String {
+        if mode == FactoryPrompts.rewriteID {
+            return route == .service ? ServicePrompts.rewrite : FactoryPrompts.rewrite
+        }
+        if let custom = overrides[mode] { return custom }
+        if route == .service { return ServicePrompts.all[mode] ?? ServicePrompts.polish }
+        return FactoryPrompts.all[mode] ?? FactoryPrompts.polish
     }
 
     public func entries() -> [PromptEntry] { Self.labels.compactMap { entry($0.id) } }
@@ -68,7 +75,9 @@ public final class PromptLibrary {
     public func save(_ mode: String, text: String) throws -> PromptEntry {
         guard let factory = FactoryPrompts.all[mode] else { throw PromptProblem.unknownMode }
         try Self.validate(text)
-        overrides[mode] = text == factory ? nil : text
+        // Either route's factory text is still factory: matching it saves
+        // nothing custom, so Reset and "Factory default" stay honest.
+        overrides[mode] = (text == factory || text == ServicePrompts.all[mode]) ? nil : text
         try persist()
         return entry(mode)!
     }

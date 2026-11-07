@@ -1,16 +1,17 @@
 import AppKit
 import QuickScribeCore
 
-/// One-screen Settings: the editable "Refine Prompts" for each mode, plus a
-/// sandbox that runs the text on screen without saving it.
+/// One-screen Settings: the custom service connection, the editable "Refine
+/// Prompts" for each mode, and a sandbox that runs the text on screen without
+/// saving it.
 @MainActor
-final class SettingsWindow: NSObject, NSTextViewDelegate {
+final class SettingsWindow: NSObject, NSTextViewDelegate, NSTextFieldDelegate {
     private static let sampleDictation =
         "um so basically the report was written by Sarah and uh we should meet at 2, actually 3, to go over it"
 
     private(set) var window: NSWindow?
     private let library: PromptLibrary
-    private let cleaner = AppleCleaner()
+    let endpointStore: EndpointSettingsStore
     private var drafts = PromptDrafts()
     private var modeID = RefineMode.all[0].id
 
@@ -24,9 +25,32 @@ final class SettingsWindow: NSObject, NSTextViewDelegate {
     private let testButton = NSButton(title: "Test Prompt", target: nil, action: nil)
     private let testOutput = SettingsWindow.makeTextView()
 
-    init(library: PromptLibrary) {
+    // Inference server controls. Model choice lives in the menu bar, not here.
+    let addressField = NSTextField(string: "")
+    let keyField = NSSecureTextField(string: "")
+    let wordsOutLabel = NSTextField(wrappingLabelWithString: "")
+    let connectionTestButton = NSButton(title: "Test Connection", target: nil, action: nil)
+    let connectionStatus = NSTextField(wrappingLabelWithString: "")
+    /// Told after the address or the key changes, so the menu's model lists can
+    /// be refreshed and a stale one dropped. (whether the address changed, whether the key changed)
+    var onConnectionChanged: ((Bool, Bool) -> Void)?
+
+    init(library: PromptLibrary, endpointStore: EndpointSettingsStore) {
         self.library = library
+        self.endpointStore = endpointStore
         super.init()
+    }
+
+    /// A choice made in the menu bar changes which routes send words out, so an
+    /// open Settings page refreshes what that changes: the words-out warning,
+    /// and the prompt editor, which shows the factory of the route cleanup now
+    /// uses. It deliberately does NOT touch the address or key fields (typed but
+    /// uncommitted text must survive) and never reads the key: a menu choice is
+    /// no reason to open the Keychain.
+    func connectionChangedOutside() {
+        guard window != nil else { return }
+        refreshWordsOutWarning()
+        showCurrentMode()
     }
 
     func show() {
@@ -35,6 +59,7 @@ final class SettingsWindow: NSObject, NSTextViewDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         reload()
+        reloadConnection()
     }
 
     // MARK: - Loading and display
@@ -44,8 +69,22 @@ final class SettingsWindow: NSObject, NSTextViewDelegate {
         showCurrentMode()
     }
 
-    private func showCurrentMode() {
-        editor.string = drafts.text(modeID)
+    private var cleanupRoute: CleanupRoute {
+        endpointStore.load().cleanupUsesEndpoint ? .service : .apple
+    }
+
+    func showCurrentMode() {
+        // While a mode is factory text, the editor shows the factory of the
+        // route that cleanup actually uses: Apple's short Polish is not the
+        // starting point for a service, and saving either factory stays
+        // factory. A custom prompt is the person's own on both routes.
+        if drafts.isDirty(modeID) {
+            editor.string = drafts.text(modeID)
+        } else if let entry = drafts.entry(modeID), entry.custom {
+            editor.string = entry.prompt
+        } else {
+            editor.string = library.prompt(modeID, route: cleanupRoute)
+        }
         refreshStatus()
     }
 
@@ -91,25 +130,54 @@ final class SettingsWindow: NSObject, NSTextViewDelegate {
         }
     }
 
+    /// Seam for tests: (route, sample, instructions, settings, key) → the model's reply.
+    var promptTester: ((CleanupRoute, String, String, EndpointSettings, String?) async throws -> String)?
+
     @objc private func testTapped() {
         testButton.isEnabled = false
         testOutput.string = "Running…"
         let sample = TextCleanup.tidy(sampleInput.string)
-        let prompt = editor.string
-        let cleaner = cleaner
+        let settings = endpointStore.load()
+        let route = settings.cleanupUsesEndpoint ? CleanupRoute.service : CleanupRoute.apple
+        // The test runs the same prompt the NEXT dictation would use: the
+        // draft if edited, a saved custom prompt, else the factory text of
+        // the route that is actually selected.
+        let entry = drafts.entry(modeID)
+        let instructions = (drafts.isDirty(modeID) || entry?.custom == true)
+            ? editor.string : library.prompt(modeID, route: route)
         Task { [weak self] in
+            guard let self else { return }
             let message: String
             do {
-                try PromptLibrary.validate(prompt)
-                if let reason = AppleCleaner.unavailableReason() { throw TestProblem(message: reason) }
-                message = try await cleaner.clean(sample, instructions: prompt)
+                try PromptLibrary.validate(instructions)
+                let run = self.promptTester ?? Self.runPromptTest
+                // The Keychain is opened only for the route that sends it a key.
+                let key = route == .service ? self.endpointStore.apiKey() : nil
+                message = try await run(route, sample, instructions, settings, key)
             } catch let failure as CleanupFailure {
                 message = Self.explain(failure)
+            } catch let failure as EndpointError {
+                message = failure.message
             } catch {
                 message = (error as? TestProblem)?.message ?? error.localizedDescription
             }
-            self?.testOutput.string = message
-            self?.testButton.isEnabled = true
+            self.testOutput.string = message
+            self.testButton.isEnabled = true
+        }
+    }
+
+    /// One cleanup on the route that is selected, through the same code a
+    /// dictation would take: Apple's model, or the service with its address,
+    /// key and cleanup model name.
+    static func runPromptTest(_ route: CleanupRoute, _ sample: String, _ instructions: String,
+                              _ settings: EndpointSettings, _ key: String?) async throws -> String {
+        switch route {
+        case .apple:
+            if let reason = AppleCleaner.unavailableReason() { throw TestProblem(message: reason) }
+            return try await AppleCleaner().clean(sample, instructions: instructions)
+        case .service:
+            let client = OpenAICompatClient(settings: settings, apiKey: key, timeout: 120)
+            return try await client.clean(text: sample, model: settings.cleanupModel, systemPrompt: instructions)
         }
     }
 
@@ -194,8 +262,62 @@ final class SettingsWindow: NSObject, NSTextViewDelegate {
         status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        // Inference server wiring: typed fields commit on focus loss or Enter.
+        addressField.placeholderString = "http://192.168.1.20:1234/v1"
+        keyField.placeholderString = "Only if your service needs one"
+        for field in [addressField, keyField] as [NSTextField] {
+            field.delegate = self
+            field.target = self
+            field.action = #selector(connectionFieldEndedEditing(_:))
+        }
+        connectionTestButton.target = self
+        connectionTestButton.action = #selector(testConnectionTapped)
+        connectionStatus.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        connectionStatus.textColor = .secondaryLabelColor
+        connectionStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        wordsOutLabel.isHidden = true
+        wordsOutLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+
+        func row(_ label: String, _ control: NSView) -> NSStackView {
+            let text = NSTextField(labelWithString: label)
+            text.alignment = .right
+            text.setContentHuggingPriority(.required, for: .horizontal)
+            text.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            control.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            let line = NSStackView(views: [text, control])
+            line.orientation = .horizontal
+            line.spacing = 8
+            line.widthAnchor.constraint(equalToConstant: 608).isActive = true
+            return line
+        }
+        let connectionRow = NSStackView(views: [connectionTestButton, connectionStatus])
+        connectionRow.orientation = .horizontal
+        connectionRow.spacing = 10
+        connectionRow.widthAnchor.constraint(equalToConstant: 608).isActive = true
+
+        let serviceStack = NSStackView(views: [
+            heading("Inference server"),
+            noteLabel("Leave the address empty to use Apple Native only. Choose your models from the menu bar icon."),
+            row("Address", addressField),
+            row("API key", keyField),
+            wordsOutLabel,
+            connectionRow,
+        ])
+        serviceStack.orientation = .vertical
+        serviceStack.alignment = .leading
+        serviceStack.spacing = 6
+        for field in [addressField, keyField] {
+            field.widthAnchor.constraint(equalToConstant: 470).isActive = true
+        }
+        for wide in [wordsOutLabel, connectionRow] {
+            wide.widthAnchor.constraint(equalToConstant: 608).isActive = true
+        }
+
         let buttons = NSStackView(views: [status, NSView(), resetButton, saveButton])
-        let stack = NSStackView(views: [
+        // Top-aligned inside the window's scroller: the report can grow and
+        // the window still fits a small screen.
+        let stack = FlippedStackView(views: [
+            serviceStack,
             heading("Refine Prompts"),
             modePicker,
             scrolling(editor, height: 250),
@@ -213,12 +335,48 @@ final class SettingsWindow: NSObject, NSTextViewDelegate {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
         }
 
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 600),
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = stack
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor).isActive = true
+        stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor).isActive = true
+        stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor).isActive = true
+        // The page is never shorter than the viewport and never clipped:
+        // these two let the scroller derive the content size from the layout.
+        stack.bottomAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.bottomAnchor).isActive = true
+        let fill = stack.bottomAnchor.constraint(equalTo: scroll.contentView.bottomAnchor)
+        fill.priority = .defaultLow
+        fill.isActive = true
+
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 800),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.title = "\(AppInfo.displayName) Settings"
         win.isReleasedWhenClosed = false
-        win.contentView = stack
+        win.contentView = scroll
+        // Fit a 13-inch MacBook Air at its default 1440x900 (visible height
+        // about 800 points) even when the Test Connection report is full: the
+        // window stays put and the page scrolls inside it.
+        win.layoutIfNeeded()
+        let needed = stack.fittingSize.height
+        let screenCap = (win.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        win.setContentSize(NSSize(width: 640, height: min(max(needed, 360), min(680, screenCap - 60))))
         win.center()
         return win
+    }
+
+    /// Draws its row list from the top, the way a page does.
+    private final class FlippedStackView: NSStackView {
+        override var isFlipped: Bool { true }
+    }
+
+    private func noteLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = .secondaryLabelColor
+        label.widthAnchor.constraint(equalToConstant: 608).isActive = true
+        return label
     }
 }

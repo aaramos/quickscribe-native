@@ -1,0 +1,37 @@
+Prompt line against invented times of day, before and after.
+
+The two temptations these sentences put in front of the model:
+  t1: Um so let's meet at two, actually three on Friday, and the plan
+      was approved by Dana.
+  t2: The pharmacy closes at nine tonight, so could you pick up the
+      prescription and some aspirin on your way home?
+5 runs, all four modes, both routes: 80 cleanups, service warm, one
+request at a time on the shared server.
+
+ANSWERS THAT TRIED TO WRITE A TIME OF DAY THE SPEAKER NEVER SAID
+  mode              apple    service
+  Polish            0/5      0/5
+  Concise           0/5      0/5
+  Active Voice      0/5      0/5
+  Rewrite           0/5      0/5
+(times per sentence: 10 runs per mode per route, all zero)
+
+INVENTED TIMES THAT REACHED TEXT: 0 of 80.
+
+Notes:
+- The prompt line alone holds: not one answer even reached for am or pm,
+  so the guard's new rule was never needed on these sentences. It stays
+  as the backstop; its own unit tests cover 3pm, 3 p.m., 3:00 PM, the
+  dotted form after a spelled hour, a spoken p.m. passing, and "I am"
+  never counting as a marker in either direction.
+- 18 of the 80 runs were stamps for a different, older reason: t2 is a
+  question and the Concise and Active Voice answers mostly returned it as
+  a plain command ("Pick up the prescription"), which the question rule
+  has always refused. The tidied words went in instead, and the pill now
+  says Cleanup dropped the question. no invented time was involved.
+  These are the numbers of the rerun after the guard's per-number rewrite;
+  the time-experiment counts themselves did not move.
+- Regenerate with: time-eval (its own corpus lives in eval/time-corpus.json;
+  runs-per-mode and an alternate corpus path are its two optional
+  arguments). The service side runs when the environment names its address,
+  model and key, same as cleanup-eval. Raw run output is not kept here.

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Assembles the menu-bar app bundle.
-# App display name + bundle id live in ONE place:
-#   Sources/QuickScribe/AppInfo.swift (displayName, bundleID)
+# App display name + bundle id + version live in ONE place:
+#   Sources/QuickScribe/AppInfo.swift (displayName, bundleID, version)
 # This script extracts them; renaming the app = edit AppInfo.swift, rebuild.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME=$(sed -n 's/.*static let displayName = "\(.*\)"/\1/p' Sources/QuickScribe/AppInfo.swift)
 BUNDLE_ID=$(sed -n 's/.*static let bundleID = "\(.*\)"/\1/p' Sources/QuickScribe/AppInfo.swift)
-[[ -n "$APP_NAME" && -n "$BUNDLE_ID" ]] || { echo "FATAL: could not read name/bundle id from AppInfo.swift" >&2; exit 1; }
+VERSION=$(sed -n 's/.*static let version = "\(.*\)"/\1/p' Sources/QuickScribe/AppInfo.swift)
+[[ -n "$APP_NAME" && -n "$BUNDLE_ID" && -n "$VERSION" ]] || { echo "FATAL: could not read name/bundle id/version from AppInfo.swift" >&2; exit 1; }
 
 echo "==> swift build -c release"
 swift build -c release --product QuickScribe
@@ -20,12 +21,15 @@ MACOS="$CONTENTS/MacOS"
 RES="$CONTENTS/Resources"
 
 echo "==> assembling $APP"
-# Kill any previous instance BEFORE swapping the bundle: a stale running
+# Kill any previous instance of THIS bundle BEFORE swapping it: a stale running
 # app with a dead tap next to a fresh build is exactly the "hotkeys don't
-# work" ghost.
-if pgrep -x "$APP_NAME" >/dev/null; then
-    echo "==> killing stale $APP_NAME instance(s): $(pgrep -x "$APP_NAME" | tr '\n' ' ')"
-    pkill -x "$APP_NAME" || true
+# work" ghost. Match the full bundle path, never the bare name — this app and
+# the original QuickScribe share an executable name, and a name match once
+# killed a live original install during a rebuild.
+STALE=$(pgrep -f -- "$PWD/$APP/Contents/MacOS/" || true)
+if [[ -n "$STALE" ]]; then
+    echo "==> killing stale instance(s) of this build: $(echo "$STALE" | tr '\n' ' ')"
+    echo "$STALE" | xargs kill || true
     sleep 1
 fi
 rm -rf "$APP"
@@ -43,16 +47,22 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>       <string>${APP_NAME}</string>
     <key>CFBundleIdentifier</key>       <string>${BUNDLE_ID}</string>
     <key>CFBundlePackageType</key>      <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>1.0</string>
-    <key>CFBundleVersion</key>          <string>1</string>
+    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
+    <key>CFBundleVersion</key>          <string>${VERSION}</string>
     <key>LSMinimumSystemVersion</key>   <string>27.0</string>
     <key>LSUIElement</key>              <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>${APP_NAME} listens while you hold the hotkey and turns your voice into text on this Mac.</string>
+    <string>${APP_NAME} listens while you hold the hotkey. Your voice is turned into text on this Mac, or at the address you set in Settings if you switch speech to a custom service.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>${APP_NAME} uses Apple's on-device speech recognition to turn your voice into text.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>${APP_NAME} pastes dictated text into the app you are using.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>${APP_NAME} reaches the speech and cleanup service you set in Settings, which may live on this Mac or your local network.</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key> <true/>
+    </dict>
 </dict>
 </plist>
 PLIST
@@ -70,6 +80,7 @@ cat > "$ENT_FILE" <<ENT
 <dict>
     <key>com.apple.security.device.audio-input</key> <true/>
     <key>com.apple.security.automation.apple-events</key> <true/>
+    <key>com.apple.security.network.client</key> <true/>
 </dict>
 </plist>
 ENT
